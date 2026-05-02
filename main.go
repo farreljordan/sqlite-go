@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"strings"
+
+	"github.com/farreljordan/sqlite-go/sqlparser"
 )
 
 // ---- Pager ----
@@ -120,84 +123,129 @@ func readVarint(r io.ByteReader) (uint64, int, error) {
 }
 
 func parseRecord(payload []byte) ([]string, error) {
-	reader := bytes.NewReader(payload)
-	headerSize, n, err := readVarint(reader)
+	r := bytes.NewReader(payload)
+
+	headerSize, _, err := readVarint(r)
 	if err != nil {
 		return nil, err
 	}
 
-	headerBytesRead := n
+	headerBytes := make([]byte, headerSize-1)
+	if _, err := r.Read(headerBytes); err != nil {
+		return nil, err
+	}
+
+	hr := bytes.NewReader(headerBytes)
+
 	var serialTypes []uint64
-	for headerBytesRead < int(headerSize) {
-		st, n, err := readVarint(reader)
+	for hr.Len() > 0 {
+		st, _, err := readVarint(hr)
 		if err != nil {
 			return nil, err
 		}
 		serialTypes = append(serialTypes, st)
-		headerBytesRead += n
 	}
 
-	var values []string
+	body := payload[headerSize:]
+	pos := 0
+
+	var cols []string
+
 	for _, st := range serialTypes {
+		var val string
+
 		switch {
 		case st == 0:
-			values = append(values, "")
-		case st == 8:
-			values = append(values, "0")
-		case st == 9:
-			values = append(values, "1")
-		case st >= 1 && st <= 6:
-			sizes := []int{0, 1, 2, 3, 4, 6, 8}
-			buf := make([]byte, sizes[st])
-			if _, err := reader.Read(buf); err != nil {
-				return nil, err
-			}
-			var val int64
-			for _, b := range buf {
-				val = (val << 8) | int64(b)
-			}
-			values = append(values, fmt.Sprintf("%d", val))
+			val = "NULL"
+
+		case st == 1:
+			val = fmt.Sprintf("%d", int8(body[pos]))
+			pos += 1
+
+		case st == 2:
+			val = fmt.Sprintf("%d", int16(binary.BigEndian.Uint16(body[pos:])))
+			pos += 2
+
+		case st == 3:
+			v := int32(body[pos])<<16 | int32(body[pos+1])<<8 | int32(body[pos+2])
+			val = fmt.Sprintf("%d", v)
+			pos += 3
+
+		case st == 4:
+			val = fmt.Sprintf("%d", int32(binary.BigEndian.Uint32(body[pos:])))
+			pos += 4
+
+		case st == 5:
+			// 6-byte big-endian signed integer
+			v := int64(body[pos])<<40 | int64(body[pos+1])<<32 | int64(body[pos+2])<<24 |
+				int64(body[pos+3])<<16 | int64(body[pos+4])<<8 | int64(body[pos+5])
+			val = fmt.Sprintf("%d", v)
+			pos += 6
+
+		case st == 6:
+			val = fmt.Sprintf("%d", int64(binary.BigEndian.Uint64(body[pos:])))
+			pos += 8
+
 		case st == 7:
-			buf := make([]byte, 8)
-			if _, err := reader.Read(buf); err != nil {
-				return nil, err
-			}
-			values = append(values, "float-placeholder")
+			// 8-byte IEEE 754 float
+			bits := binary.BigEndian.Uint64(body[pos:])
+			f := math.Float64frombits(bits)
+			val = fmt.Sprintf("%g", f)
+			pos += 8
+
+		case st == 8:
+			// integer constant 0, zero bytes
+			val = "0"
+
+		case st == 9:
+			// integer constant 1, zero bytes
+			val = "1"
+
 		case st >= 13 && st%2 == 1:
-			size := (st - 13) / 2
-			buf := make([]byte, size)
-			if _, err := reader.Read(buf); err != nil {
-				return nil, err
-			}
-			values = append(values, string(buf))
+			size := int((st - 13) / 2)
+			val = string(body[pos : pos+size])
+			pos += size
+
 		case st >= 12 && st%2 == 0:
-			size := (st - 12) / 2
-			buf := make([]byte, size)
-			if _, err := reader.Read(buf); err != nil {
-				return nil, err
-			}
-			values = append(values, string(buf))
+			size := int((st - 12) / 2)
+			val = fmt.Sprintf("%x", body[pos:pos+size])
+			pos += size
+
 		default:
-			values = append(values, "")
+			return nil, fmt.Errorf("unsupported serial type: %d", st)
 		}
+
+		cols = append(cols, val)
 	}
-	return values, nil
+
+	return cols, nil
 }
 
-func parseCell(pageBytes []byte, cellOffset uint16) ([]string, error) {
-	reader := bytes.NewReader(pageBytes[cellOffset:])
-	payloadSize, _, err := readVarint(reader)
+func parseCell(page []byte, offset uint16) ([]string, int64, error) {
+	i := int(offset)
+
+	r := bytes.NewReader(page[i:])
+
+	payloadSize, n1, err := readVarint(r)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	if _, _, err = readVarint(reader); err != nil { // rowid
-		return nil, err
+	i += n1
+
+	rowid, n2, err := readVarint(r)
+	if err != nil {
+		return nil, 0, err
 	}
-	payload := make([]byte, payloadSize)
-	if _, err = io.ReadFull(reader, payload); err != nil {
-		return nil, err
+	i += n2
+
+	payload := page[i : i+int(payloadSize)]
+
+	cols, err := parseRecord(payload)
+	if err != nil {
+		return nil, 0, err
 	}
-	return parseRecord(payload)
+
+	return cols, int64(rowid), nil
 }
 
 // ---- Schema scanning ----
@@ -222,7 +270,7 @@ func scanSchema(pager *Pager, fn func(columns []string) error) error {
 	for i := 0; i < int(ph.CellCount); i++ {
 		off := pointerBase + i*2
 		cellOffset := binary.BigEndian.Uint16(page1[off : off+2])
-		cols, err := parseCell(page1, cellOffset)
+		cols, _, err := parseCell(page1, cellOffset)
 		if err != nil {
 			return err
 		}
@@ -230,6 +278,71 @@ func scanSchema(pager *Pager, fn func(columns []string) error) error {
 			return err
 		}
 	}
+	return nil
+}
+
+func scanTable(
+	pager *Pager,
+	pageNum uint32,
+	processRow func(cols []string, rowid int64) error,
+) error {
+	pageBytes, err := pager.GetPage(pageNum)
+	if err != nil {
+		return err
+	}
+
+	// determine header offset
+	headerOffset := 0
+	if pageNum == 1 {
+		headerOffset = 100
+	}
+
+	ph, err := parsePageHeader(pageBytes[headerOffset : headerOffset+8])
+	if err != nil {
+		return err
+	}
+
+	switch ph.PageType {
+
+	case 0x0D: // leaf table page
+		pointerBase := headerOffset + 8 // 8-byte header for leaf pages
+		for i := 0; i < int(ph.CellCount); i++ {
+			ptr := pointerBase + i*2
+			cellOffset := binary.BigEndian.Uint16(pageBytes[ptr : ptr+2])
+
+			cols, rowid, err := parseCell(pageBytes, cellOffset)
+			if err != nil {
+				return err
+			}
+
+			if err := processRow(cols, rowid); err != nil {
+				return err
+			}
+		}
+
+	case 0x05: // interior table page — header is 12 bytes (includes 4-byte right-most pointer)
+		// Right-most child pointer lives at bytes 8-11 of the page header.
+		rightMost := binary.BigEndian.Uint32(pageBytes[headerOffset+8 : headerOffset+12])
+		// Cell pointer array starts after the 12-byte interior header.
+		pointerBase := headerOffset + 12
+		for i := 0; i < int(ph.CellCount); i++ {
+			ptr := pointerBase + i*2
+			cellOffset := binary.BigEndian.Uint16(pageBytes[ptr : ptr+2])
+
+			// Each interior cell: 4-byte left child page number, then varint key.
+			childPage := binary.BigEndian.Uint32(pageBytes[cellOffset : cellOffset+4])
+
+			if err := scanTable(pager, childPage, processRow); err != nil {
+				return err
+			}
+		}
+
+		return scanTable(pager, rightMost, processRow)
+
+	default:
+		return fmt.Errorf("unsupported page type: %d", ph.PageType)
+	}
+
 	return nil
 }
 
@@ -343,14 +456,229 @@ func runDotCommand(pager *Pager, input string) error {
 }
 
 func execSQL(pager *Pager, query string) error {
-	upper := strings.ToUpper(strings.TrimSpace(query))
-	switch {
-	case strings.HasPrefix(upper, "SELECT COUNT(*) FROM "):
-		tableName := strings.TrimSpace(query[len("SELECT COUNT(*) FROM "):])
-		return execSelectCount(pager, tableName)
-	default:
-		return fmt.Errorf("unsupported query: %s", query)
+	stmt, err := sqlparser.Parse(query)
+	if err != nil {
+		return fmt.Errorf("parse error: %w", err)
 	}
+
+	switch s := stmt.(type) {
+	case *sqlparser.Select:
+		return execSelect(pager, s)
+	default:
+		return fmt.Errorf("unsupported statement")
+	}
+}
+
+// TODO: still not using index, in companies.db there is idx_companies_country
+func execSelect(pager *Pager, s *sqlparser.Select) error {
+	if len(s.SelectExprs) == 1 && sqlparser.IsCountStar(s.SelectExprs[0]) {
+		return execSelectCount(pager, s.From.Name)
+	}
+
+	var colNames []string
+
+	for _, expr := range s.SelectExprs {
+		col, ok := expr.(*sqlparser.ColExpr)
+		if !ok {
+			return fmt.Errorf("unsupported select expression")
+		}
+		colNames = append(colNames, col.Name)
+	}
+
+	return execSelectCols(pager, s.From.Name, colNames, s.Where)
+}
+
+func execSelectCols(pager *Pager, tableName string, colNames []string, where *sqlparser.WhereClause) error {
+	var rootPage uint32
+	var createSQL string
+
+	if err := scanSchema(pager, func(cols []string) error {
+		if len(cols) > 4 && cols[0] == "table" && cols[2] == tableName {
+			fmt.Sscanf(cols[3], "%d", &rootPage)
+			createSQL = cols[4]
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if rootPage == 0 {
+		return fmt.Errorf("table not found: %s", tableName)
+	}
+
+	type colRef struct {
+		idx     int
+		isRowID bool
+	}
+
+	colRefs := make([]colRef, len(colNames))
+	for i, colName := range colNames {
+		idx, err := columnIndex(createSQL, colName)
+		if err != nil {
+			if strings.Contains(err.Error(), "rowid alias") {
+				colRefs[i] = colRef{isRowID: true}
+				continue
+			}
+			return err
+		}
+		colRefs[i] = colRef{idx: idx}
+	}
+
+	var whereRef *struct {
+		idx     int
+		isRowID bool
+		value   string
+	}
+
+	if where != nil {
+		idx, err := columnIndex(createSQL, where.Column)
+		if err != nil {
+			if strings.Contains(err.Error(), "rowid alias") {
+				whereRef = &struct {
+					idx     int
+					isRowID bool
+					value   string
+				}{
+					isRowID: true,
+					value:   where.Value,
+				}
+			} else {
+				return err
+			}
+		} else {
+			whereRef = &struct {
+				idx     int
+				isRowID bool
+				value   string
+			}{
+				idx:   idx,
+				value: where.Value,
+			}
+		}
+	}
+
+	return scanTable(pager, rootPage, func(cols []string, rowid int64) error {
+		if whereRef != nil {
+			var v string
+
+			if whereRef.isRowID {
+				v = fmt.Sprintf("%d", rowid)
+			} else if whereRef.idx < len(cols) {
+				v = cols[whereRef.idx]
+			} else {
+				v = "NULL"
+			}
+
+			if v != whereRef.value {
+				return nil // skip row
+			}
+		}
+
+		// SELECT output
+		for j, ref := range colRefs {
+			if ref.isRowID {
+				fmt.Print(rowid)
+			} else if ref.idx < len(cols) {
+				fmt.Print(cols[ref.idx])
+			} else {
+				fmt.Print("NULL")
+			}
+
+			if j < len(colRefs)-1 {
+				fmt.Print("|")
+			}
+		}
+		fmt.Println()
+
+		return nil
+	})
+}
+
+func splitTopLevel(s string, sep rune) []string {
+	var parts []string
+	depth, start := 0, 0
+	for i, ch := range s {
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case sep:
+			if depth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(parts, s[start:])
+}
+
+func extractIdentifier(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) == 0 {
+		return ""
+	}
+	switch s[0] {
+	case '"', '`', '\'':
+		q := s[0]
+		if end := strings.IndexByte(s[1:], q); end != -1 {
+			return s[1 : end+1]
+		}
+	case '[':
+		if end := strings.IndexByte(s, ']'); end != -1 {
+			return s[1:end]
+		}
+	}
+	if f := strings.Fields(s); len(f) > 0 {
+		return f[0]
+	}
+	return ""
+}
+
+func columnIndex(createSQL, colName string) (int, error) {
+	start := strings.Index(createSQL, "(")
+	end := strings.LastIndex(createSQL, ")")
+	if start == -1 || end == -1 {
+		return -1, fmt.Errorf("cannot parse CREATE TABLE: %s", createSQL)
+	}
+
+	defs := splitTopLevel(createSQL[start+1:end], ',')
+
+	idx := 0
+	for _, def := range defs {
+		def = strings.TrimSpace(def)
+		if def == "" {
+			continue
+		}
+
+		upper := strings.ToUpper(def)
+
+		if strings.HasPrefix(upper, "PRIMARY KEY") ||
+			strings.HasPrefix(upper, "UNIQUE") ||
+			strings.HasPrefix(upper, "CHECK") ||
+			strings.HasPrefix(upper, "FOREIGN KEY") {
+			continue
+		}
+
+		name := extractIdentifier(def)
+
+		// INTEGER PRIMARY KEY = rowid alias
+		if strings.Contains(upper, "INTEGER") && strings.Contains(upper, "PRIMARY KEY") {
+			if strings.EqualFold(name, colName) {
+				return -1, fmt.Errorf("column %q is the rowid alias; not stored in record", colName)
+			}
+			idx++ // IMPORTANT: still occupies position
+			continue
+		}
+
+		if strings.EqualFold(name, colName) {
+			return idx, nil
+		}
+
+		idx++
+	}
+
+	return -1, fmt.Errorf("column %q not found in: %s", colName, createSQL)
 }
 
 func execSelectCount(pager *Pager, tableName string) error {
@@ -368,15 +696,14 @@ func execSelectCount(pager *Pager, tableName string) error {
 		return fmt.Errorf("table not found: %s", tableName)
 	}
 
-	pageBytes, err := pager.GetPage(rootPage)
-	if err != nil {
+	var count int64
+	if err := scanTable(pager, rootPage, func(_ []string, _ int64) error {
+		count++
+		return nil
+	}); err != nil {
 		return err
 	}
-	ph, err := parsePageHeader(pageBytes[:schemaBTreeHeaderLen])
-	if err != nil {
-		return err
-	}
-	fmt.Println(ph.CellCount)
+	fmt.Println(count)
 	return nil
 }
 
